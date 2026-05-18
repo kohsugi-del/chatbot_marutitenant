@@ -23,7 +23,8 @@ type ChatBody = {
   question?: string;
   message?: string;
   top_k?: number;
-  messages?: ClientMsg[]; // ★追加：会話履歴
+  messages?: ClientMsg[];
+  session_id?: string; // フロントから渡すセッションID
 };
 
 // ---- OpenAI ----
@@ -231,6 +232,43 @@ export async function POST(req: NextRequest) {
       score: Number(r.similarity),
     }));
 
+    // ── 会話ログを Supabase に保存 ────────────────────────────────
+    if (body.session_id) {
+      try {
+        // セッションを upsert（既存なら無視）
+        await supabase
+          .from("sessions")
+          .upsert(
+            { id: body.session_id, municipality_id: "htrk-asahikawa" },
+            { onConflict: "id" }
+          );
+
+        // turn_order は body.messages の長さで決まる
+        // （フロントは常に「今回のuser発話」を末尾に含めて送る）
+        const userTurnOrder = body.messages?.length ?? 1;
+        const assistantTurnOrder = userTurnOrder + 1;
+
+        await supabase.from("turns").insert([
+          {
+            session_id: body.session_id,
+            turn_order: userTurnOrder,
+            role: "user",
+            content: q,
+          },
+          {
+            session_id: body.session_id,
+            turn_order: assistantTurnOrder,
+            role: "assistant",
+            content: answer,
+          },
+        ]);
+      } catch (logErr) {
+        // ログ失敗でも回答は返す
+        console.error("[log] failed to save turn:", logErr);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────
+
     return NextResponse.json({
       answer,
       references,
@@ -239,7 +277,7 @@ export async function POST(req: NextRequest) {
         rpc: RPC_NAME,
         hits: retrieved.length,
         threshold: MATCH_THRESHOLD,
-        used_history: history.length, // ★デバッグ：履歴が使われてるか確認できる
+        used_history: history.length,
       },
     });
   } catch (e: any) {

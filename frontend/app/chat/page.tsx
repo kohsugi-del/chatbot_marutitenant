@@ -12,6 +12,7 @@ type Msg = { role: "user" | "assistant"; content: string };
 
 // ====== 会話履歴保持（localStorage） ======
 const LS_KEY = "rag_chat_messages_v1";
+const LS_SESSION_KEY = "rag_chat_session_v1";
 
 // コスト気にしない前提でも、無限に増えると遅くなるので安全上限だけ入れます（必要なら増やしてOK）
 const MAX_STORE_TURNS = 200; // 保存するメッセージ数上限
@@ -30,6 +31,7 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [thinking, setThinking] = useState(false);
+  const [sessionId, setSessionId] = useState<string>("");
 
   // UI表示用：API疎通状態
   const [apiStatus, setApiStatus] = useState<"idle" | "connected" | "error">(
@@ -49,6 +51,15 @@ export default function ChatPage() {
     const saved = safeJsonParse<Msg[]>(localStorage.getItem(LS_KEY));
     if (Array.isArray(saved) && saved.length) {
       setMessages(saved);
+    }
+    // セッションID：既存を再利用 or 新規生成
+    const savedSession = localStorage.getItem(LS_SESSION_KEY);
+    if (savedSession) {
+      setSessionId(savedSession);
+    } else {
+      const newId = crypto.randomUUID();
+      setSessionId(newId);
+      localStorage.setItem(LS_SESSION_KEY, newId);
     }
   }, []);
 
@@ -73,6 +84,10 @@ export default function ChatPage() {
     setInput("");
     setApiStatus("idle");
     localStorage.removeItem(LS_KEY);
+    // 「クリア」＝新しい会話の開始 → セッションIDを更新
+    const newId = crypto.randomUUID();
+    setSessionId(newId);
+    localStorage.setItem(LS_SESSION_KEY, newId);
   };
 
   async function sendMessage() {
@@ -102,6 +117,7 @@ export default function ChatPage() {
           message: userMessage,
           top_k: 8,
           messages: nextMessages.slice(-MAX_SEND_TURNS),
+          session_id: sessionId,
         }),
       });
 

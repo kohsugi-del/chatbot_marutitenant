@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import BackButton from "@/components/BackButton";
 import StatusBadge from "@/components/StatusBadge";
 
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
 type UiStatus = "pending" | "processing" | "done" | "error";
 
 type FileItem = {
@@ -15,79 +17,66 @@ type FileItem = {
   created_at?: string;
 };
 
-const LS_KEY = "ingest_files_v1";
-
-/** localStorage から読み込み */
-function loadFiles(): FileItem[] {
-  try {
-    const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed as FileItem[];
-  } catch {
-    return [];
-  }
-}
-
-/** localStorage へ保存 */
-function saveFiles(files: FileItem[]) {
-  localStorage.setItem(LS_KEY, JSON.stringify(files));
-}
-
-/** 疑似 ingest：少し待って done にする（チャンク数も適当につける） */
-async function fakeIngest(): Promise<{ ingested_chunks: number }> {
-  const ms = 600 + Math.floor(Math.random() * 800);
-  await new Promise((r) => setTimeout(r, ms));
-  return { ingested_chunks: 5 + Math.floor(Math.random() * 20) };
-}
-
 export default function IngestPage() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("");
+  const [errorMsg, setErrorMsg] = useState("");
 
-  /** 一覧取得（ローカル） */
+  /** 一覧取得（API） */
   const fetchFiles = async () => {
-    const list: FileItem[] = loadFiles().sort((a, b) => b.id - a.id);
-    setFiles(list);
+    try {
+      const res = await fetch(`${API_BASE}/files`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: FileItem[] = await res.json();
+      setFiles(data);
+      setErrorMsg("");
+    } catch (e) {
+      console.error("fetchFiles:", e);
+      setErrorMsg("バックエンドに接続できません。サーバーが起動しているか確認してください。");
+    }
   };
 
-  /** 1件アップロード（ローカル登録）＋疑似 ingest */
-  const uploadOne = async (file: File) => {
-    const newId = Date.now(); // 簡易ID
+  /** PDFアップロード → ingest実行（API） */
+  const uploadOne = async (file: File): Promise<void> => {
+    // 1. アップロード
+    const formData = new FormData();
+    formData.append("file", file);
 
-    const item: FileItem = {
-      id: newId,
-      filename: file.name,
-      status: "processing",
-      ingested_chunks: null,
-      error_message: null,
-      created_at: new Date().toISOString(),
-    };
+    const uploadRes = await fetch(`${API_BASE}/files`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!uploadRes.ok) {
+      const detail = await uploadRes.json().catch(() => ({}));
+      throw new Error(detail?.detail ?? `アップロード失敗 HTTP ${uploadRes.status}`);
+    }
+    const uploaded: FileItem = await uploadRes.json();
 
-    // 追加
-    const next: FileItem[] = [item, ...loadFiles()];
-    saveFiles(next);
-    setFiles(next);
+    // UIに即反映（processing状態）
+    setFiles((prev) => [{ ...uploaded, status: "processing" }, ...prev]);
 
-    // 疑似 ingest
-    const r = await fakeIngest();
+    // 2. ingest実行
+    const ingestRes = await fetch(`${API_BASE}/files/${uploaded.id}/ingest_local`, {
+      method: "POST",
+    });
+    if (!ingestRes.ok) {
+      const detail = await ingestRes.json().catch(() => ({}));
+      throw new Error(detail?.detail ?? `Ingest失敗 HTTP ${ingestRes.status}`);
+    }
+    const result = await ingestRes.json();
 
-    // ✅ ここが肝：after を FileItem[] として確定させる
-    const after: FileItem[] = loadFiles().map((f) =>
-      f.id === newId
-        ? { ...f, status: "done", ingested_chunks: r.ingested_chunks }
-        : f
+    // 完了状態に更新
+    setFiles((prev) =>
+      prev.map((f) =>
+        f.id === uploaded.id
+          ? { ...f, status: "done", ingested_chunks: result.ingested_chunks ?? null }
+          : f
+      )
     );
-
-    saveFiles(after);
-    setFiles(after);
-
-    return { id: newId, ingested_chunks: r.ingested_chunks };
   };
 
-  /** 複数アップロード */
+  /** 複数ファイルアップロード */
   const uploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files ?? []);
     if (selected.length === 0) return;
@@ -103,9 +92,9 @@ export default function IngestPage() {
     }
 
     setLoading(true);
-    try {
-      setStatus(`アップロード開始：${pdfs.length}件`);
+    setErrorMsg("");
 
+    try {
       let ok = 0;
       let ng = 0;
 
@@ -116,8 +105,10 @@ export default function IngestPage() {
         try {
           await uploadOne(file);
           ok++;
-        } catch (err) {
+        } catch (err: unknown) {
           console.error("[UPLOAD NG]", file.name, err);
+          const msg = err instanceof Error ? err.message : String(err);
+          setErrorMsg(`${file.name}: ${msg}`);
           ng++;
         }
       }
@@ -130,57 +121,53 @@ export default function IngestPage() {
     }
   };
 
-  /** 再取り込み（疑似） */
+  /** 再取り込み（API） */
   const reingestFile = async (id: number) => {
     setLoading(true);
     setStatus("再取り込み中…");
+    setErrorMsg("");
 
-    // ✅ before を FileItem[] として確定
-    const before: FileItem[] = loadFiles().map((f) =>
-      f.id === id ? { ...f, status: "processing" } : f
-    );
-    saveFiles(before);
-    setFiles(before);
+    setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, status: "processing" } : f)));
 
     try {
-      const r = await fakeIngest();
+      const res = await fetch(`${API_BASE}/files/${id}/ingest_local`, { method: "POST" });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail ?? `HTTP ${res.status}`);
+      }
+      const result = await res.json();
 
-      // ✅ after を FileItem[] として確定
-      const after: FileItem[] = loadFiles().map((f) =>
-        f.id === id
-          ? { ...f, status: "done", ingested_chunks: r.ingested_chunks }
-          : f
+      setFiles((prev) =>
+        prev.map((f) =>
+          f.id === id
+            ? { ...f, status: "done", ingested_chunks: result.ingested_chunks ?? null }
+            : f
+        )
       );
-
-      saveFiles(after);
-      setFiles(after);
-
-      setStatus(`再取り込み完了（${r.ingested_chunks} チャンク）`);
-    } catch (e) {
-      console.error(e);
-
-      const afterErr: FileItem[] = loadFiles().map((f) =>
-        f.id === id ? { ...f, status: "error" } : f
+      setStatus(`再取り込み完了（${result.ingested_chunks ?? "?"} チャンク）`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setFiles((prev) =>
+        prev.map((f) => (f.id === id ? { ...f, status: "error", error_message: msg } : f))
       );
-
-      saveFiles(afterErr);
-      setFiles(afterErr);
-      setStatus("再取り込みに失敗しました。");
+      setErrorMsg(`再取り込みに失敗しました: ${msg}`);
+      setStatus("");
     } finally {
       setLoading(false);
     }
   };
 
-  /** 削除（ローカル） */
+  /** 削除（API） */
   const deleteFile = async (id: number) => {
     if (!confirm("このファイルを削除しますか？")) return;
-
     setLoading(true);
     try {
-      const after: FileItem[] = loadFiles().filter((f) => f.id !== id);
-      saveFiles(after);
-      setFiles(after);
+      const res = await fetch(`${API_BASE}/files/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await fetchFiles();
       setStatus("削除しました。");
+    } catch (e: unknown) {
+      setErrorMsg(`削除に失敗しました: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoading(false);
     }
@@ -190,7 +177,6 @@ export default function IngestPage() {
     fetchFiles();
     const timer = setInterval(fetchFiles, 5000);
     return () => clearInterval(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -215,20 +201,26 @@ export default function IngestPage() {
             <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-zinc-300">
               files: {files.length}
             </span>
-            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-zinc-300">
-              mode: local
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-emerald-300">
+              mode: API
             </span>
           </div>
         </div>
 
+        {errorMsg && (
+          <div className="mb-4 rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200">
+            {errorMsg}
+          </div>
+        )}
+
         <section className="mb-6 rounded-3xl border border-white/10 bg-white/5 p-5 backdrop-blur">
           <div className="mb-2 text-sm font-semibold">アップロード</div>
           <p className="text-sm text-zinc-400">
-            ※このページは「フロントだけ」で動作します（実際のインデックス化は行いません）。
+            PDFをアップロードすると自動でチャンク化・ベクトル化してSupabaseに保存されます。
           </p>
 
           <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <label className="inline-flex w-fit cursor-pointer items-center justify-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:opacity-90">
+            <label className="inline-flex w-fit cursor-pointer items-center justify-center rounded-xl bg-white px-4 py-2 text-sm font-semibold text-zinc-900 hover:opacity-90 disabled:opacity-60">
               <input
                 type="file"
                 accept=".pdf"
@@ -278,15 +270,12 @@ export default function IngestPage() {
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <div className="truncate text-sm font-semibold">
-                          {file.filename}
-                        </div>
+                        <div className="truncate text-sm font-semibold">{file.filename}</div>
                         <span className="text-xs text-zinc-500">#{file.id}</span>
                       </div>
-
                       <div className="mt-1 text-xs text-zinc-400">
                         {file.ingested_chunks != null && file.status === "done" && (
-                          <>・{file.ingested_chunks} チャンク</>
+                          <>・{file.ingested_chunks} チャンク保存済み</>
                         )}
                         {file.error_message && <>・エラー: {file.error_message}</>}
                       </div>
@@ -302,7 +291,7 @@ export default function IngestPage() {
                           className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs hover:bg-white/10 disabled:opacity-60"
                           title="再取り込み"
                         >
-                          🔄 再
+                          🔄 再取込
                         </button>
                       )}
 
@@ -312,7 +301,7 @@ export default function IngestPage() {
                         className="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-200 hover:bg-red-500/15 disabled:opacity-60"
                         title="削除"
                       >
-                        🗑 削
+                        🗑 削除
                       </button>
                     </div>
                   </div>
@@ -322,9 +311,7 @@ export default function IngestPage() {
           )}
         </section>
 
-        <div className="mt-8 text-center text-xs text-zinc-500">
-          Ingest Dashboard
-        </div>
+        <div className="mt-8 text-center text-xs text-zinc-500">Ingest Dashboard</div>
       </div>
     </div>
   );
