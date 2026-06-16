@@ -1,16 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Image from "next/image";
+import ChatMascot from "@/components/ChatMascot";
 
 type Props = {
   embedPath?: string;
-  iconSrc?: string;
 };
 
 export default function FloatingChatLauncher({
   embedPath = "/embed",
-  iconSrc = "/chatbot_icon2.jpg",
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -52,27 +50,8 @@ export default function FloatingChatLauncher({
         />
       </div>
 
-      {/* 右下アイコン */}
-      <button
-        onClick={() => setOpen((v) => !v)}
-        className={[
-          "fixed z-[999999] right-4 bottom-4",
-          "w-14 h-14 rounded-full overflow-hidden",
-          "bg-white border border-black/5",
-          "shadow-2xl active:scale-95 transition",
-        ].join(" ")}
-        aria-label="open chat"
-        type="button"
-      >
-        <Image
-          src={iconSrc}
-          alt="Open chat"
-          width={56}
-          height={56}
-          className="w-full h-full object-cover"
-          priority
-        />
-      </button>
+      {/* 右下のマスコットボタン（常時表示・クリックでパネル開閉） */}
+      <ChatMascot onClick={() => setOpen((v) => !v)} />
     </>
   );
 }

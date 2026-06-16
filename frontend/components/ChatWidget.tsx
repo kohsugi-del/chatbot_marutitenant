@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
+import ChatMascot from "@/components/ChatMascot";
 
 type Msg = {
   role: "user" | "assistant";
@@ -300,73 +301,10 @@ export default function ChatWidget({
     border: `1px solid ${THEME.botBorder}`,
   };
 
-  // =========================
-  // ロボットボタン（閉じている状態）
-  // 「白背景＋水色の円枠＋中央に画像」デザイン
-  // =========================
-  const fabBtn: React.CSSProperties = {
-    position: "fixed",
-    right: 16,
-    bottom: 16,
-    width: 56,
-    height: 56,
-    borderRadius: "50%",
-    background: "#ffffff",
-    border: `3px solid ${THEME.brand1}`,
-    boxShadow: "0 12px 30px rgba(46,197,244,0.35)",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: "pointer",
-    zIndex: Z,
-    padding: 0,
-  };
-
-  // 画像の「■感」を減らすための保険（角を丸く＋収まりを良くする）
-  // ※ 元画像が白背景JPEGでも「円枠＋白背景」に吸収されるので、見た目は整います
-  const fabImgWrap: React.CSSProperties = {
-    width: 30,
-    height: 30,
-    borderRadius: 9999,
-    overflow: "hidden",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-  };
-
   return (
     <>
-      {/* 右下のロボットボタン */}
-      {!open && (
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          aria-label="チャットを開く"
-          style={fabBtn}
-          onMouseEnter={(e) => {
-            const btn = e.currentTarget as HTMLButtonElement;
-            btn.style.transform = "translateY(-1px)";
-            btn.style.boxShadow = "0 14px 34px rgba(46,197,244,0.40)";
-            btn.style.transition = "all 120ms ease";
-          }}
-          onMouseLeave={(e) => {
-            const btn = e.currentTarget as HTMLButtonElement;
-            btn.style.transform = "translateY(0)";
-            btn.style.boxShadow = "0 12px 30px rgba(46,197,244,0.35)";
-          }}
-        >
-          <span style={fabImgWrap}>
-            <Image
-              src="/chatbot_icon2.jpg"
-              alt="robot"
-              width={30}
-              height={30}
-              priority
-              style={{ objectFit: "contain" }}
-            />
-          </span>
-        </button>
-      )}
+      {/* 右下のマスコットボタン */}
+      {!open && <ChatMascot onClick={() => setOpen(true)} />}
 
       {/* チャットパネル */}
       {open && (

@@ -7,6 +7,6 @@ export default function ClientWidgets() {
   if (pathname === "/embed") return null; // embedでは出さない
 
   return (
-    <FloatingChatLauncher embedPath="/embed" iconSrc="/chatbot_icon2.jpg" />
+    <FloatingChatLauncher embedPath="/embed" />
   );
 }

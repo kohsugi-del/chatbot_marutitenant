@@ -16,7 +16,7 @@ import {
 import { getClientConfig } from "@/lib/getClientConfig";
 import type { ConversationMode, ClientConfig, ChatRequest, ChatResponse } from "@/types/log";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
 function env(name: string): string | undefined {
@@ -65,12 +65,15 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
   auth: { persistSession: false },
 });
 
-const RPC_NAME = env("SUPABASE_MATCH_RPC") ?? "match_documents";
+const RPC_NAME = env("SUPABASE_MATCH_RPC") ?? "hybrid_search_documents";
 const MATCH_THRESHOLD = Number(env("SUPABASE_MATCH_THRESHOLD") ?? "0");
 
 // ============================================================
 // RAGコア（埋め込み・検索）
 // ============================================================
+
+const RERANKER_MODEL = "claude-haiku-4-5-20251001";
+const RERANKER_TOP_N = Number(env("RERANKER_TOP_N") ?? "5");
 
 async function embedQuery(text: string): Promise<number[]> {
   const res = await openai.embeddings.create({
@@ -88,19 +91,25 @@ type Retrieved = {
   similarity: number;
 };
 
-// モードに応じてcategoryフィルタを切り替えてベクター検索
+// Hybrid Search: ベクター検索 + キーワード検索 (RRF統合)
 async function searchSupabase(
   query: string,
   topK: number,
-  mode: ConversationMode
+  mode: ConversationMode,
+  tenantId?: string
 ): Promise<Retrieved[]> {
   const qEmb = await embedQuery(query);
 
   const args: Record<string, unknown> = {
     query_embedding: qEmb,
+    query_text: query,
     match_count: topK,
   };
   if (MATCH_THRESHOLD > 0) args.match_threshold = MATCH_THRESHOLD;
+
+  if (tenantId) {
+    args.filter_tenant_id = tenantId;
+  }
 
   // emergencyモードは緊急カテゴリのドキュメントのみ検索
   if (mode === "emergency") {
@@ -125,6 +134,64 @@ async function searchSupabase(
       return { id, text, source, title, similarity };
     })
     .filter((r) => r.text.length > 0);
+}
+
+// ============================================================
+// Reranker（Claude Haikuによる関連度再評価）
+// ============================================================
+
+async function rerankDocuments(
+  query: string,
+  docs: Retrieved[],
+  topN: number
+): Promise<{ docs: Retrieved[]; scores: number[] }> {
+  if (docs.length <= 1) {
+    return { docs: docs.slice(0, topN), scores: docs.map(() => 10) };
+  }
+
+  const docList = docs
+    .map((d, i) => `[${i + 1}] ${d.text.slice(0, 400)}`)
+    .join("\n\n---\n\n");
+
+  const prompt = `ユーザーの質問に対して、各ドキュメントの関連度を0〜10で評価してください。
+
+質問: ${query}
+
+ドキュメント一覧:
+${docList}
+
+JSONのみを返してください（説明不要）:
+{"scores": [{"index": 1, "score": 8}, {"index": 2, "score": 3}, ...]}`;
+
+  try {
+    const res = await anthropic.messages.create({
+      model: RERANKER_MODEL,
+      max_tokens: 512,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const text = res.content[0]?.type === "text" ? res.content[0].text : "";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return { docs: docs.slice(0, topN), scores: [] };
+
+    const { scores } = JSON.parse(jsonMatch[0]) as {
+      scores: { index: number; score: number }[];
+    };
+    const scoreMap = new Map(scores.map((s) => [s.index - 1, s.score]));
+
+    const ranked = docs
+      .map((d, i) => ({ doc: d, rerankScore: scoreMap.get(i) ?? 0 }))
+      .sort((a, b) => b.rerankScore - a.rerankScore)
+      .slice(0, topN);
+
+    return {
+      docs: ranked.map((x) => x.doc),
+      scores: ranked.map((x) => x.rerankScore),
+    };
+  } catch {
+    // Reranker失敗時はHybrid Searchの順序をそのまま使う
+    return { docs: docs.slice(0, topN), scores: [] };
+  }
 }
 
 function lastUserFromHistory(body: ChatBody): string {
@@ -187,33 +254,147 @@ function buildSystemPrompt(
 }
 
 // ============================================================
-// Claude向けメッセージ構築
+// Agentic RAG（Claude tool_use による自律再検索）
 // ============================================================
 
-function buildClaudeMessages(opts: {
+const AGENTIC_MAX_ITER = Number(env("AGENTIC_MAX_ITER") ?? "3");
+
+type SearchEntry = {
+  iteration: number;
+  query: string;
+  reason: string;
+  hits: number;
+};
+
+async function agenticRAG(opts: {
   question: string;
   history: ClientMsg[];
-  contexts: { text: string; source: string }[];
-}): Array<{ role: "user" | "assistant"; content: string }> {
-  const { question, history, contexts } = opts;
+  initialDocs: Retrieved[];
+  mode: ConversationMode;
+  tenantId: string | undefined;
+  systemPrompt: string;
+}): Promise<{
+  answer: string;
+  usedDocs: Retrieved[];
+  searchLog: SearchEntry[];
+  iterations: number;
+}> {
+  const { question, history, initialDocs, mode, tenantId, systemPrompt } = opts;
 
-  const ctx = contexts
-    .map((c) => `source: ${c.source}\n${c.text}`.trim())
-    .join("\n\n");
+  // source をキーに重複排除しながら全ドキュメント管理
+  const docMap = new Map<string, Retrieved>();
+  for (const d of initialDocs) docMap.set(d.source || d.id, d);
 
-  const finalUser = `# 資料
-${ctx || "(資料なし)"}
-
-# 今回の質問
-${question}
-
-# 回答（日本語）
-`;
-
-  return [
-    ...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
-    { role: "user" as const, content: finalUser },
+  const searchLog: SearchEntry[] = [
+    { iteration: 0, query: question, reason: "初回検索", hits: initialDocs.length },
   ];
+
+  const buildCtx = () =>
+    [...docMap.values()]
+      .map((d) => `source: ${d.source}\n${d.text}`.trim())
+      .join("\n\n") || "(資料なし)";
+
+  // ツール定義
+  const tools: Anthropic.Tool[] = [
+    {
+      name: "search_knowledge_base",
+      description:
+        "社内知識ベースを検索して関連情報を取得します。" +
+        "情報が不足している場合や、複数の異なるトピックを調べる必要がある場合に使ってください。",
+      input_schema: {
+        type: "object" as const,
+        properties: {
+          query: { type: "string" as const, description: "検索クエリ（具体的なキーワードや質問文）" },
+          reason: { type: "string" as const, description: "この検索を行う理由（例：「電話番号を調べるため」）" },
+        },
+        required: ["query", "reason"],
+      },
+    },
+  ];
+
+  // 会話履歴 + 最初のユーザーメッセージ
+  type AMsg = Anthropic.MessageParam;
+  const messages: AMsg[] = [
+    ...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+    {
+      role: "user" as const,
+      content:
+        `# 取得済み資料\n${buildCtx()}\n\n` +
+        `# 質問\n${question}\n\n` +
+        "資料で回答できない情報がある場合は search_knowledge_base ツールを使ってください。" +
+        "すべての情報があれば直接回答してください。",
+    },
+  ];
+
+  let iterations = 0;
+  let finalAnswer = "";
+
+  while (true) {
+    const response = await anthropic.messages.create({
+      model: env("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6",
+      max_tokens: 2048,
+      system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+      tools,
+      messages,
+    });
+
+    // ツール呼び出しなし → 最終回答
+    if (response.stop_reason !== "tool_use") {
+      const textBlock = response.content.find((b) => b.type === "text");
+      finalAnswer = textBlock?.type === "text" ? textBlock.text : "";
+      break;
+    }
+
+    // ツール呼び出し処理
+    messages.push({ role: "assistant" as const, content: response.content as AMsg["content"] });
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = [];
+
+    for (const block of response.content) {
+      if (block.type !== "tool_use") continue;
+
+      iterations++;
+      const { query, reason } = block.input as { query: string; reason: string };
+
+      // 追加検索（Hybrid Search + Reranker）
+      const addRaw = await searchSupabase(query, 10, mode, tenantId);
+      const { docs: addReranked } = addRaw.length > 0
+        ? await rerankDocuments(query, addRaw, 3)
+        : { docs: [] };
+
+      for (const d of addReranked) docMap.set(d.source || d.id, d);
+
+      searchLog.push({ iteration: iterations, query, reason, hits: addReranked.length });
+
+      const resultCtx =
+        addReranked.map((d) => `source: ${d.source}\n${d.text}`.trim()).join("\n\n") ||
+        "(該当なし)";
+
+      toolResults.push({ type: "tool_result", tool_use_id: block.id, content: resultCtx });
+    }
+
+    messages.push({ role: "user" as const, content: toolResults });
+
+    // 上限到達 → ツールなしで強制最終回答
+    if (iterations >= AGENTIC_MAX_ITER) {
+      const finalResp = await anthropic.messages.create({
+        model: env("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6",
+        max_tokens: 2048,
+        system: [{ type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }],
+        messages,
+      });
+      const textBlock = finalResp.content.find((b) => b.type === "text");
+      finalAnswer = textBlock?.type === "text" ? textBlock.text : "";
+      break;
+    }
+  }
+
+  return {
+    answer: finalAnswer,
+    usedDocs: [...docMap.values()],
+    searchLog,
+    iterations,
+  };
 }
 
 // ============================================================
@@ -235,12 +416,20 @@ export async function POST(req: NextRequest) {
     const clientId = body.client_id ?? env("NEXT_PUBLIC_CLIENT_ID") ?? "asahikawa-gas";
     const mode: ConversationMode = body.mode ?? "normal";
     const sessionId = body.session_id ?? crypto.randomUUID();
+    // tenant_id: リクエストボディ優先 → 環境変数 → clientId（フォールバック）
+    const tenantId = body.tenant_id ?? env("NEXT_PUBLIC_TENANT_ID") ?? clientId;
 
     // ── クライアント設定取得 ──────────────────────────────────
     const config = await getClientConfig(clientId);
 
-    // ── 1) RAG検索（モードによってカテゴリフィルタを切替）────
-    const retrieved = await searchSupabase(q, topK, mode);
+    // ── 1) RAG検索（Hybrid Search）────────────────────────────
+    const retrieved = await searchSupabase(q, topK, mode, tenantId);
+
+    // ── 1.5) Reranker（Claudeによる関連度再評価）────────────
+    const { docs: reranked, scores: rerankScores } =
+      retrieved.length > 0
+        ? await rerankDocuments(q, retrieved, RERANKER_TOP_N)
+        : { docs: [], scores: [] };
 
     // ── 2) 会話履歴 ──────────────────────────────────────────
     const history = normalizeHistory(body, 60);
@@ -248,8 +437,10 @@ export async function POST(req: NextRequest) {
     // ── 3) エスカレーション判定（クライアント設定のキーワード使用）──
     const matchedKeyword =
       config.emergencyKeywords.find((kw) => q.includes(kw)) ?? null;
-    const confidenceScore = retrieved.length > 0 ? retrieved[0].similarity : 0;
+    // Reranker後の1位ドキュメントのスコアを信頼度として使用
+    const confidenceScore = reranked.length > 0 ? reranked[0].similarity : 0;
     const isLowConfidence = confidenceScore < 0.5 && retrieved.length > 0;
+    const rerankedForLog = reranked; // ログ用に初回Reranker結果を保持
 
     // ── カテゴリ自動判定 ──────────────────────────────────────
     // 緊急キーワードにマッチ → キーワード名をそのままカテゴリに（例: "ガス漏れ"）
@@ -269,31 +460,23 @@ export async function POST(req: NextRequest) {
     // ── 4) システムプロンプト生成 ─────────────────────────────
     const systemPrompt = buildSystemPrompt(categoryId, mode, config);
 
-    // ── 5) 回答生成（Claude・プロンプトキャッシュ対応）──────
-    const claudeMessages = buildClaudeMessages({
+    // ── 5) Agentic RAG（自律再検索 + 回答生成）─────────────
+    const startMs = Date.now();
+    const {
+      answer: rawAnswer,
+      usedDocs,
+      searchLog,
+      iterations: agenticIterations,
+    } = await agenticRAG({
       question: q,
       history,
-      contexts: retrieved.map((r) => ({ text: r.text, source: r.source })),
-    });
-
-    const startMs = Date.now();
-    const chat = await anthropic.messages.create({
-      model: env("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6",
-      max_tokens: 2048,
-      // システムプロンプトをキャッシュ（5分TTL）
-      system: [
-        {
-          type: "text",
-          text: systemPrompt,
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      messages: claudeMessages,
+      initialDocs: reranked,
+      mode,
+      tenantId,
+      systemPrompt,
     });
     const responseMs = Date.now() - startMs;
 
-    const rawAnswer =
-      chat.content[0]?.type === "text" ? chat.content[0].text : "";
     const answer = rawAnswer.replace(/\[#\d+\]/g, "").replace(/\s{2,}/g, " ").trim();
 
     // ── 6) ログ書き込み ───────────────────────────────────────
@@ -326,9 +509,9 @@ export async function POST(req: NextRequest) {
         content: answer,
         confidenceScore,
         keywordMatched: matchedKeyword,
-        retrievedDocIds: retrieved.map((r) => r.id).filter(Boolean),
-        retrievedDocTitles: retrieved.map((r) => r.title),
-        retrievedDocSources: retrieved.map((r) => r.source),
+        retrievedDocIds: usedDocs.map((r) => r.id).filter(Boolean),
+        retrievedDocTitles: usedDocs.map((r) => r.title),
+        retrievedDocSources: usedDocs.map((r) => r.source),
         responseMs,
         unresolved: isLowConfidence && !matchedKeyword,
       });
@@ -342,7 +525,7 @@ export async function POST(req: NextRequest) {
       conversation_id: conversationId ?? "",
       answer,
       confidence_score: confidenceScore,
-      retrieved_docs: retrieved.map((r) => ({
+      retrieved_docs: usedDocs.map((r) => ({
         id: r.id,
         title: r.title,
         source: r.source,
@@ -359,10 +542,16 @@ export async function POST(req: NextRequest) {
         top_k: topK,
         rpc: RPC_NAME,
         hits: retrieved.length,
+        reranker_model: RERANKER_MODEL,
+        reranker_top_n: RERANKER_TOP_N,
+        reranked: rerankedForLog.length,
+        rerank_scores: rerankScores,
+        agentic_iterations: agenticIterations,
+        agentic_search_log: searchLog,
+        used_docs: usedDocs.length,
         mode,
         client_id: clientId,
         model: env("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6",
-        cache_tokens: chat.usage.cache_read_input_tokens ?? 0,
       },
     });
   } catch (e: unknown) {

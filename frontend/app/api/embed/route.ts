@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-export const runtime = "nodejs"; // Edgeにしない（OpenAI/Supabaseで安定）
+export const runtime = "edge";
 export const dynamic = "force-dynamic";
 
 function env(name: string): string | undefined {
