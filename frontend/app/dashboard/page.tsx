@@ -4,7 +4,8 @@ import { useState, useEffect } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { Building2, Download } from "lucide-react"
+import { ArrowLeft, Building2, Download } from "lucide-react"
+import Link from "next/link"
 import type { GasDashboardProps } from "@/lib/gas-mock-data"
 import { GasKpiCards } from "@/components/gas-dashboard/gas-kpi-cards"
 import { PhoneEscalationCard } from "@/components/gas-dashboard/phone-escalation-card"
@@ -18,7 +19,7 @@ import { ModeHistoryList } from "@/components/gas-dashboard/mode-history"
 
 const YEARS = [2024, 2025, 2026]
 const MONTHS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-const CLIENT_ID = process.env.NEXT_PUBLIC_CLIENT_ID ?? "asahikawa-gas"
+const CLIENT_ID = process.env.NEXT_PUBLIC_CLIENT_ID ?? "default"
 
 // /api/dashboard/stats のレスポンス型
 type StatsResponse = {
@@ -158,13 +159,20 @@ export default function DashboardPage() {
         {/* Header */}
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
+            <Link
+              href="/"
+              className="mb-2 inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <ArrowLeft className="h-3 w-3" />
+              管理ダッシュボードに戻る
+            </Link>
             <h1 className="text-xl font-bold text-foreground tracking-tight">AIチャットボット運用ダッシュボード</h1>
-            <p className="mt-1 text-sm text-muted-foreground">ガス会社向け月次レポート</p>
+            <p className="mt-1 text-sm text-muted-foreground">月次運用レポート</p>
           </div>
           <div className="flex items-center gap-2">
             <Badge variant="secondary" className="gap-1 text-xs">
               <Building2 className="h-3 w-3" />
-              旭川ガス
+              {CLIENT_ID}
             </Badge>
             <div className="flex items-center gap-1">
               <Select value={selectedYear.toString()} onValueChange={(v) => setSelectedYear(parseInt(v))}>
@@ -251,7 +259,7 @@ export default function DashboardPage() {
 
         <footer className="mt-8 border-t border-border/40 pt-4 pb-6">
           <p className="text-center text-xs text-muted-foreground">
-            {`${selectedYear}年${selectedMonth}月度 月次運用レポート | 旭川ガス AIチャットボット | CONFIDENTIAL`}
+            {`${selectedYear}年${selectedMonth}月度 月次運用レポート | AIチャットボット | CONFIDENTIAL`}
           </p>
         </footer>
       </div>

@@ -5,6 +5,11 @@ import BackButton from "@/components/BackButton";
 import StatusBadge from "@/components/StatusBadge";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_BACKEND_API_KEY ?? "";
+
+function apiHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return API_KEY ? { "X-API-Key": API_KEY, ...extra } : extra;
+}
 
 type UiStatus = "pending" | "processing" | "done" | "error";
 
@@ -26,7 +31,7 @@ export default function IngestPage() {
   /** 一覧取得（API） */
   const fetchFiles = async () => {
     try {
-      const res = await fetch(`${API_BASE}/files`);
+      const res = await fetch(`${API_BASE}/files`, { headers: apiHeaders() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: FileItem[] = await res.json();
       setFiles(data);
@@ -45,6 +50,7 @@ export default function IngestPage() {
 
     const uploadRes = await fetch(`${API_BASE}/files`, {
       method: "POST",
+      headers: apiHeaders(),
       body: formData,
     });
     if (!uploadRes.ok) {
@@ -59,6 +65,7 @@ export default function IngestPage() {
     // 2. ingest実行
     const ingestRes = await fetch(`${API_BASE}/files/${uploaded.id}/ingest_local`, {
       method: "POST",
+      headers: apiHeaders(),
     });
     if (!ingestRes.ok) {
       const detail = await ingestRes.json().catch(() => ({}));
@@ -130,7 +137,7 @@ export default function IngestPage() {
     setFiles((prev) => prev.map((f) => (f.id === id ? { ...f, status: "processing" } : f)));
 
     try {
-      const res = await fetch(`${API_BASE}/files/${id}/ingest_local`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/files/${id}/ingest_local`, { method: "POST", headers: apiHeaders() });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail?.detail ?? `HTTP ${res.status}`);
@@ -162,7 +169,7 @@ export default function IngestPage() {
     if (!confirm("このファイルを削除しますか？")) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/files/${id}`, { method: "DELETE" });
+      const res = await fetch(`${API_BASE}/files/${id}`, { method: "DELETE", headers: apiHeaders() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchFiles();
       setStatus("削除しました。");

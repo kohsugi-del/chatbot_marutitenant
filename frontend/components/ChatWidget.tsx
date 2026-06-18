@@ -4,6 +4,81 @@ import { useEffect, useRef, useState } from "react";
 import Image from "next/image";
 import ChatMascot from "@/components/ChatMascot";
 
+// ボット回答を読みやすく整形する
+function renderBotText(raw: string): React.ReactNode {
+  // スペース直後の・（箇条書き）の前に改行を挿入
+  // ※「農業・林業」のようにスペースなしの連結用・には影響しない
+  const normalized = raw
+    .replace(/[ 　]+・/g, "\n・")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const lines = normalized.split("\n");
+  const nodes: React.ReactNode[] = [];
+  const pendingBullets: string[] = [];
+
+  const flushBullets = (key: string) => {
+    if (pendingBullets.length === 0) return;
+    nodes.push(
+      <div
+        key={key}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: 4,
+          marginTop: 6,
+          marginBottom: 4,
+          paddingLeft: 10,
+          borderLeft: "3px solid rgba(46,197,244,0.45)",
+        }}
+      >
+        {pendingBullets.map((text, bi) => (
+          <div key={bi} style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
+            <span style={{ color: "#2EC5F4", fontWeight: 700, lineHeight: "1.65", flexShrink: 0 }}>
+              ・
+            </span>
+            <span style={{ flex: 1, lineHeight: "1.65" }}>{text}</span>
+          </div>
+        ))}
+      </div>
+    );
+    pendingBullets.length = 0;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) {
+      flushBullets(`flush-${i}`);
+      continue;
+    }
+    if (line.startsWith("・")) {
+      pendingBullets.push(line.slice(1).trim());
+    } else {
+      flushBullets(`flush-before-${i}`);
+      const nextNonEmpty = lines.slice(i + 1).find((l) => l.trim())?.trim() ?? "";
+      const isHeader = nextNonEmpty.startsWith("・") && line.length <= 16;
+      nodes.push(
+        <p
+          key={i}
+          style={{
+            margin: nodes.length > 0 ? "10px 0 2px" : "0 0 2px",
+            fontWeight: isHeader ? 700 : 400,
+            fontSize: isHeader ? 11 : "inherit",
+            color: isHeader ? "#555" : "inherit",
+            letterSpacing: isHeader ? "0.05em" : undefined,
+            lineHeight: 1.7,
+          }}
+        >
+          {line}
+        </p>
+      );
+    }
+  }
+  flushBullets("final");
+
+  return <>{nodes}</>;
+}
+
 type Msg = {
   role: "user" | "assistant";
   content: string;
@@ -24,11 +99,14 @@ type Props = {
   defaultOpen?: boolean;
   /** タイトル表示 */
   title?: string;
+  /** テナントID（UUID）。未指定の場合は環境変数のデフォルトを使用 */
+  tenantId?: string;
 };
 
 export default function ChatWidget({
   defaultOpen = false,
-  title = "旭川ガス　お客さまサポート",
+  title = "AIカスタマーサポート",
+  tenantId,
 }: Props) {
   // ===== Theme（ロボット色味に合わせた）=====
   const THEME = {
@@ -52,15 +130,15 @@ export default function ChatWidget({
   } as const;
 
   const CATEGORIES = [
-    { icon: "🏠", label: "ご家庭のお客様",   id: "家庭用",     fullWidth: false },
-    { icon: "🏢", label: "業務用のお客様",   id: "業務用",     fullWidth: false },
-    { icon: "⚙️", label: "ガスの開栓・閉栓", id: "手続き・契約", fullWidth: false },
-    { icon: "🔧", label: "ガス機器",         id: "ガス機器",   fullWidth: false },
+    { icon: "💬", label: "サービスについて", id: "サービス",   fullWidth: false },
+    { icon: "📋", label: "手続き・契約",     id: "手続き・契約", fullWidth: false },
+    { icon: "💡", label: "よくある質問",     id: "よくある質問", fullWidth: false },
+    { icon: "📞", label: "お問い合わせ",     id: "お問い合わせ", fullWidth: false },
     { icon: "👥", label: "会社・採用",       id: "会社・採用", fullWidth: true  },
   ];
 
   const TERMS = [
-    "本サービスは、生成AIを活用しており、旭川ガスが用意した情報に基づき、生成AIが自動で質問にお答えするサービスです。ガスのご利用・お手続き・料金・安全に関する情報の確認や調べ物のサポートとして、適切にご利用ください。",
+    "本サービスは、生成AIを活用しており、登録された情報に基づき、生成AIが自動で質問にお答えするサービスです。サービス・手続き・料金などに関する情報の確認や調べ物のサポートとして、適切にご利用ください。",
     "質問によっては誤った回答が表示される場合がございます。回答の際に参考情報のリンク先が表示される場合は、あわせてご確認いただき、正確な情報かどうかをご判断ください。",
     "本サービスは生成AIを活用した機能のため、13歳未満のご利用はお控えください。また、18歳未満の方は保護者の許可を得てご利用ください。",
     "本サービスにおいて入力されたデータの内容は回答用の学習データとしては利用いたしません。入力した情報が他の利用者への回答に利用されることはありませんのでご安心ください。ただし、個人情報（氏名、住所、電話番号、お客様番号など）は入力しないでください。",
@@ -112,6 +190,7 @@ export default function ChatWidget({
           messages: nextMessages,
           session_id: sessionId,
           category_id: cat.id,
+          ...(tenantId ? { tenant_id: tenantId } : {}),
         }),
       });
       const data = await res.json().catch(() => ({})) as ChatApiResponse;
@@ -147,6 +226,7 @@ export default function ChatWidget({
           messages: nextMessages,
           session_id: sessionId,
           category_id: categoryId,
+          ...(tenantId ? { tenant_id: tenantId } : {}),
         }),
       });
 
@@ -276,12 +356,11 @@ export default function ChatWidget({
   });
 
   const bubbleBase: React.CSSProperties = {
-    maxWidth: "88%",
-    padding: "10px 12px",
+    maxWidth: "90%",
+    padding: "12px 14px",
     borderRadius: 16,
-    fontSize: 13,
-    lineHeight: 1.6,
-    whiteSpace: "pre-wrap",
+    fontSize: 14,
+    lineHeight: 1.7,
     wordBreak: "break-word",
   };
 
@@ -291,6 +370,7 @@ export default function ChatWidget({
     color: "#fff",
     background: THEME.userGrad,
     boxShadow: "0 10px 22px rgba(46,197,244,0.25)",
+    whiteSpace: "pre-wrap",
   };
 
   const botBubble: React.CSSProperties = {
@@ -466,7 +546,9 @@ export default function ChatWidget({
               const isUser = m.role === "user";
               return (
                 <div key={i}>
-                  <div style={isUser ? userBubble : botBubble}>{m.content}</div>
+                  <div style={isUser ? userBubble : botBubble}>
+                    {isUser ? m.content : renderBotText(m.content)}
+                  </div>
                   {!isUser && m.messageId && (
                     <div style={{ display: "flex", gap: 6, marginTop: 4, marginLeft: 2 }}>
                       <button

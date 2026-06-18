@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import BackButton from "@/components/BackButton";
 
 type Tenant = {
@@ -453,30 +454,47 @@ export default function TenantsPage() {
                     </div>
                   ) : (
                     // 表示モード
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="font-semibold text-sm">{t.name}</div>
-                        <div className="mt-1 font-mono text-xs text-zinc-400 truncate">{t.id}</div>
-                        <div className="mt-1 font-mono text-xs text-zinc-500 truncate">
-                          key: {t.api_key.slice(0, 12)}…
+                    <div className="space-y-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-semibold text-sm">{t.name}</div>
+                          <div className="mt-1 font-mono text-xs text-zinc-400 truncate">{t.id}</div>
+                          <div className="mt-1 font-mono text-xs text-zinc-500 truncate">
+                            key: {t.api_key.slice(0, 12)}…
+                          </div>
+                          <div className="mt-2 text-xs text-zinc-500 line-clamp-2">{t.system_prompt}</div>
                         </div>
-                        <div className="mt-2 text-xs text-zinc-500 line-clamp-2">{t.system_prompt}</div>
+                        <div className="flex gap-2 shrink-0">
+                          <Link
+                            href={`/embed?tenant_id=${t.id}&title=${encodeURIComponent(t.name)}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="rounded-xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-300 hover:bg-sky-500/15 whitespace-nowrap"
+                          >
+                            チャットをテスト ↗
+                          </Link>
+                          <button
+                            onClick={() => startEdit(t)}
+                            className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs hover:bg-white/10 whitespace-nowrap"
+                          >
+                            編集
+                          </button>
+                          <button
+                            onClick={() => deleteTenant(t.id, t.name)}
+                            disabled={loading}
+                            className="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 hover:bg-red-500/15 disabled:opacity-60 whitespace-nowrap"
+                          >
+                            削除
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex gap-2 shrink-0">
-                        <button
-                          onClick={() => startEdit(t)}
-                          className="rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs hover:bg-white/10 whitespace-nowrap"
-                        >
-                          編集
-                        </button>
-                        <button
-                          onClick={() => deleteTenant(t.id, t.name)}
-                          disabled={loading}
-                          className="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300 hover:bg-red-500/15 disabled:opacity-60 whitespace-nowrap"
-                        >
-                          削除
-                        </button>
-                      </div>
+                      {/* 埋め込みコード */}
+                      <details className="text-xs text-zinc-500">
+                        <summary className="cursor-pointer hover:text-zinc-300 select-none">埋め込みコードを表示</summary>
+                        <div className="mt-2 rounded-xl bg-black/40 p-3 font-mono text-zinc-400 break-all">
+                          {`<iframe src="http://localhost:3000/embed?tenant_id=${t.id}" width="400" height="600" frameborder="0" />`}
+                        </div>
+                      </details>
                     </div>
                   )}
                 </div>

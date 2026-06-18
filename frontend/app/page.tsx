@@ -47,13 +47,13 @@ const cards: Card[] = [
     icon: "📊",
     badge: { label: "Report", tone: "ok" },
   },
-  // {
-  //   title: "管理",
-  //   desc: "全体設定・実行状況・メンテナンス",
-  //   href: "/admin",
-  //   icon: "🛠️",
-  //   badge: { label: "Admin", tone: "warn" },
-  // },
+  {
+    title: "テナント管理",
+    desc: "テナント作成・APIキー発行・一覧確認",
+    href: "/tenants",
+    icon: "🏢",
+    badge: { label: "Admin", tone: "warn" },
+  },
 ];
 
 function Badge({

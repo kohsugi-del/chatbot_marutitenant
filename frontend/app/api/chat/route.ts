@@ -1,11 +1,12 @@
 // app/api/chat/route.ts
 // 埋め込み: OpenAI text-embedding-3-small
 // 回答生成: Claude claude-sonnet-4-6
-// 対象: asahikawa-gas.co.jp（クライアント設定ファイルで切替可）
+// テナント: NEXT_PUBLIC_CLIENT_ID 環境変数で切替（デフォルト: default）
 
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { createClient } from "@supabase/supabase-js";
 import {
   startConversation,
@@ -43,8 +44,31 @@ type ChatBody = Partial<ChatRequest> & {
 // ---- OpenAI（埋め込みのみ）----
 const openai = new OpenAI({ apiKey: mustEnv("OPENAI_API_KEY") });
 
-// ---- Anthropic（回答生成）----
+// ---- Anthropic（回答生成・Reranker・Reflection）----
 const anthropic = new Anthropic({ apiKey: mustEnv("ANTHROPIC_API_KEY") });
+
+// ---- Google Gemini（Query Rewrite・Context Compression）----
+const GEMINI_API_KEY = env("GOOGLE_GENERATIVE_AI_API_KEY") ?? "";
+const geminiAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
+// gemini-2.5-flash: 精度重視・Thinking無効化（Edge Runtime対応）
+const GEMINI_MODEL = "gemini-2.5-flash";
+
+async function geminiComplete(system: string, user: string, maxTokens = 1024): Promise<string> {
+  if (!geminiAI) throw new Error("GOOGLE_GENERATIVE_AI_API_KEY is not set");
+  const model = geminiAI.getGenerativeModel({
+    model: GEMINI_MODEL,
+    systemInstruction: system,
+  });
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: user }] }],
+    generationConfig: {
+      maxOutputTokens: maxTokens,
+      // @ts-expect-error thinkingConfig is supported by gemini-2.5-flash but not yet typed in SDK 0.24.x
+      thinkingConfig: { thinkingBudget: 0 },
+    },
+  });
+  return result.response.text();
+}
 
 // ---- Supabase（ベクター検索）----
 const SUPABASE_URL = env("SUPABASE_URL") ?? env("NEXT_PUBLIC_SUPABASE_URL") ?? "";
@@ -214,19 +238,41 @@ function normalizeHistory(body: ChatBody, maxTurns = 60): ClientMsg[] {
 }
 
 // ============================================================
+// テナントシステムプロンプト取得（バックエンドAPI）
+// ============================================================
+
+async function fetchTenantSystemPrompt(tenantId: string): Promise<string | null> {
+  const apiBase = env("NEXT_PUBLIC_API_BASE") ?? "http://localhost:8000";
+  const adminSecret = env("ADMIN_SECRET") ?? "";
+  if (!adminSecret) return null;
+  try {
+    const res = await fetch(`${apiBase}/tenants/${tenantId}`, {
+      headers: { "X-Admin-Secret": adminSecret },
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const tenant = await res.json() as { system_prompt?: string };
+    return tenant.system_prompt ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ============================================================
 // システムプロンプト生成（クライアント設定・モード対応）
 // ============================================================
 
 function buildSystemPrompt(
   categoryId: string | null,
   mode: ConversationMode,
-  config: ClientConfig
+  config: ClientConfig,
+  tenantSystemPrompt?: string | null
 ): string {
-  const base = `あなたは${config.clientId}のカスタマーサポートAIです。
+  const base = tenantSystemPrompt
+    ? tenantSystemPrompt
+    : `あなたは${config.clientId}のカスタマーサポートAIです。
 提供された資料をもとに回答してください。
-資料に根拠がない場合は「お電話でご確認ください」と案内してください。
-回答の末尾には「この回答は解決の参考になりましたか？」を記載してください。
-お電話での案内が必要な場合：${config.phoneNumbers.normal}（${config.businessHours}）
+資料に根拠がない場合は「詳しくはサービスの公式サイトをご確認いただくか、直接お問い合わせください」と案内してください。
 
 【回答形式の注意】
 - マークダウン記法（##、**、---、|テーブル|など）は使わないでください
@@ -254,6 +300,108 @@ function buildSystemPrompt(
 }
 
 // ============================================================
+// Query Rewrite（曖昧なクエリを複数の検索クエリに展開）
+// ============================================================
+
+async function queryRewrite(query: string): Promise<string[]> {
+  const system = `あなたは検索クエリ最適化の専門家です。ユーザーの質問を、知識ベース検索に適した具体的なクエリに展開してください。
+ルール:
+- 2〜4個のクエリを生成する
+- 重複した意味のクエリは出力しない
+- 必ずJSON配列のみを返す。説明文は一切不要。
+例: ["定休日", "営業時間", "祝日営業", "年末年始休業"]`;
+
+  try {
+    const raw = await geminiComplete(system, query, 256);
+    const cleaned = raw.trim().startsWith("```")
+      ? raw.trim().split("```")[1].replace(/^json/, "").trim().split("```")[0].trim()
+      : raw.trim();
+    const queries = JSON.parse(cleaned) as string[];
+    if (Array.isArray(queries) && queries.every((q) => typeof q === "string")) {
+      if (!queries.includes(query)) queries.unshift(query);
+      return queries.slice(0, 5);
+    }
+  } catch { /* fallthrough */ }
+  return [query];
+}
+
+// ============================================================
+// Context Compression（質問に必要な部分だけ抽出）
+// ============================================================
+
+async function compressContext(query: string, docs: Retrieved[]): Promise<string> {
+  if (docs.length === 0) return "(資料なし)";
+
+  const context = docs
+    .map((d) => `source: ${d.source}\n${d.text}`)
+    .join("\n\n---\n\n");
+
+  const system = `あなたはテキスト圧縮の専門家です。与えられた資料から、ユーザーの質問に答えるために必要な情報だけを抽出してください。
+ルール:
+- 質問に直接関係する文章・数値・固有名詞のみ残す
+- 不要な前置き・繰り返し・無関係な内容は削除する
+- 資料に書かれていないことは絶対に追加しない
+- source情報は保持する（"source: URL" の行はそのまま残す）`;
+
+  try {
+    return await geminiComplete(
+      system,
+      `# 質問\n${query}\n\n# 資料\n${context}\n\n# 指示\n質問に必要な情報だけを抽出してください。`,
+      2048,
+    );
+  } catch {
+    return context;
+  }
+}
+
+// ============================================================
+// Reflection（回答の自己評価・再検索判断）
+// ============================================================
+
+type ReflectionResult = {
+  enough: boolean;
+  reason: string;
+  needMoreSearch: boolean;
+  additionalQueries: string[];
+};
+
+async function reflectOnAnswer(
+  query: string,
+  answer: string,
+  context: string
+): Promise<ReflectionResult> {
+  const system = `あなたは回答品質の評価専門家です。必ず以下のJSON形式のみで返してください。説明文は不要です。
+{"enough": true, "reason": "評価理由", "need_more_search": false, "additional_queries": []}`;
+
+  try {
+    const res = await anthropic.messages.create({
+      model: RERANKER_MODEL,
+      max_tokens: 512,
+      system,
+      messages: [{
+        role: "user",
+        content: `# 質問\n${query}\n\n# 参照資料\n${context}\n\n# 生成された回答\n${answer}\n\n評価してください。`,
+      }],
+    });
+    const raw = res.content[0]?.type === "text" ? res.content[0].text.trim() : "";
+    const cleaned = raw.startsWith("```")
+      ? raw.split("```")[1].replace(/^json/, "").trim().split("```")[0].trim()
+      : raw;
+    const data = JSON.parse(cleaned) as Record<string, unknown>;
+    return {
+      enough: Boolean(data.enough ?? true),
+      reason: String(data.reason ?? ""),
+      needMoreSearch: Boolean(data.need_more_search ?? false),
+      additionalQueries: Array.isArray(data.additional_queries)
+        ? (data.additional_queries as string[])
+        : [],
+    };
+  } catch {
+    return { enough: true, reason: "評価スキップ", needMoreSearch: false, additionalQueries: [] };
+  }
+}
+
+// ============================================================
 // Agentic RAG（Claude tool_use による自律再検索）
 // ============================================================
 
@@ -273,6 +421,7 @@ async function agenticRAG(opts: {
   mode: ConversationMode;
   tenantId: string | undefined;
   systemPrompt: string;
+  compressedContext?: string;
 }): Promise<{
   answer: string;
   usedDocs: Retrieved[];
@@ -313,13 +462,15 @@ async function agenticRAG(opts: {
   ];
 
   // 会話履歴 + 最初のユーザーメッセージ
+  // compressedContext が渡された場合はそれを初期資料として使う（Context Compression適用済み）
+  const initialCtx = opts.compressedContext ?? buildCtx();
   type AMsg = Anthropic.MessageParam;
   const messages: AMsg[] = [
     ...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
     {
       role: "user" as const,
       content:
-        `# 取得済み資料\n${buildCtx()}\n\n` +
+        `# 取得済み資料\n${initialCtx}\n\n` +
         `# 質問\n${question}\n\n` +
         "資料で回答できない情報がある場合は search_knowledge_base ツールを使ってください。" +
         "すべての情報があれば直接回答してください。",
@@ -413,7 +564,7 @@ export async function POST(req: NextRequest) {
     }
 
     const topK = Math.max(1, Math.min(Number(body.top_k ?? 20), 60));
-    const clientId = body.client_id ?? env("NEXT_PUBLIC_CLIENT_ID") ?? "asahikawa-gas";
+    const clientId = body.client_id ?? env("NEXT_PUBLIC_CLIENT_ID") ?? "default";
     const mode: ConversationMode = body.mode ?? "normal";
     const sessionId = body.session_id ?? crypto.randomUUID();
     // tenant_id: リクエストボディ優先 → 環境変数 → clientId（フォールバック）
@@ -422,14 +573,32 @@ export async function POST(req: NextRequest) {
     // ── クライアント設定取得 ──────────────────────────────────
     const config = await getClientConfig(clientId);
 
-    // ── 1) RAG検索（Hybrid Search）────────────────────────────
-    const retrieved = await searchSupabase(q, topK, mode, tenantId);
+    // ── 1) Query Rewrite（クエリ展開）────────────────────────
+    const rewrittenQueries = await queryRewrite(q);
 
-    // ── 1.5) Reranker（Claudeによる関連度再評価）────────────
+    // ── 2) RAG検索（展開クエリ × Hybrid Search・重複排除）──
+    const seenSources = new Set<string>();
+    const allRetrieved: Retrieved[] = [];
+    for (const rq of rewrittenQueries) {
+      const results = await searchSupabase(rq, topK, mode, tenantId);
+      for (const r of results) {
+        const key = r.source || r.text.slice(0, 100);
+        if (!seenSources.has(key)) {
+          seenSources.add(key);
+          allRetrieved.push(r);
+        }
+      }
+    }
+    const retrieved = allRetrieved;
+
+    // ── 2.5) Reranker（Claudeによる関連度再評価）───────────
     const { docs: reranked, scores: rerankScores } =
       retrieved.length > 0
         ? await rerankDocuments(q, retrieved, RERANKER_TOP_N)
         : { docs: [], scores: [] };
+
+    // ── 2.7) Context Compression（必要な部分だけ抽出）───────
+    const compressed = await compressContext(q, reranked);
 
     // ── 2) 会話履歴 ──────────────────────────────────────────
     const history = normalizeHistory(body, 60);
@@ -458,7 +627,8 @@ export async function POST(req: NextRequest) {
     const categoryId = body.category_id ?? autoCategory;
 
     // ── 4) システムプロンプト生成 ─────────────────────────────
-    const systemPrompt = buildSystemPrompt(categoryId, mode, config);
+    const tenantSystemPrompt = await fetchTenantSystemPrompt(tenantId);
+    const systemPrompt = buildSystemPrompt(categoryId, mode, config, tenantSystemPrompt);
 
     // ── 5) Agentic RAG（自律再検索 + 回答生成）─────────────
     const startMs = Date.now();
@@ -474,10 +644,14 @@ export async function POST(req: NextRequest) {
       mode,
       tenantId,
       systemPrompt,
+      compressedContext: compressed,
     });
     const responseMs = Date.now() - startMs;
 
     const answer = rawAnswer.replace(/\[#\d+\]/g, "").replace(/\s{2,}/g, " ").trim();
+
+    // ── 5.5) Reflection（回答の自己評価・再検索判断）────────
+    const reflection = await reflectOnAnswer(q, answer, compressed);
 
     // ── 6) ログ書き込み ───────────────────────────────────────
     let conversationId = body.conversation_id ?? null;
@@ -552,6 +726,12 @@ export async function POST(req: NextRequest) {
         mode,
         client_id: clientId,
         model: env("ANTHROPIC_MODEL") ?? "claude-sonnet-4-6",
+        query_rewrite_queries: rewrittenQueries,
+        reflection: {
+          enough: reflection.enough,
+          reason: reflection.reason,
+          need_more_search: reflection.needMoreSearch,
+        },
       },
     });
   } catch (e: unknown) {

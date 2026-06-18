@@ -137,7 +137,7 @@ function generateModeHistory(): ModeHistory[] {
 }
 
 export const mockGasDashboard: GasDashboardProps = {
-  clientId: "asahikawa-gas",
+  clientId: "default",
   reportMonth: "3",
   reportYear: 2026,
   monthlyStats: {

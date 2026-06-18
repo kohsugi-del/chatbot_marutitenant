@@ -5,6 +5,13 @@ import StatusBadge from "@/components/StatusBadge";
 import BackButton from "@/components/BackButton";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_BACKEND_API_KEY ?? "";
+
+function apiHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return API_KEY
+    ? { "X-API-Key": API_KEY, ...extra }
+    : extra;
+}
 
 type SiteStatus = "pending" | "crawling" | "done" | "error";
 
@@ -65,7 +72,7 @@ export default function WebSiteManagePage() {
   /** 一覧取得（API） */
   const fetchSites = async () => {
     try {
-      const res = await fetch(`${API_BASE}/sites`);
+      const res = await fetch(`${API_BASE}/sites`, { headers: apiHeaders() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: Site[] = await res.json();
       setSites(data);
@@ -85,7 +92,7 @@ export default function WebSiteManagePage() {
         prev.map((s) => (s.id === id ? { ...s, status: "crawling", error_message: null } : s))
       );
 
-      const res = await fetch(`${API_BASE}/sites/${id}/reingest_local`, { method: "POST" });
+      const res = await fetch(`${API_BASE}/sites/${id}/reingest_local`, { method: "POST", headers: apiHeaders() });
       if (!res.ok) {
         const detail = await res.json().catch(() => ({}));
         throw new Error(detail?.detail ?? `HTTP ${res.status}`);
@@ -112,7 +119,7 @@ export default function WebSiteManagePage() {
     try {
       const res = await fetch(`${API_BASE}/sites`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: apiHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ url: u, scope, type: FIXED_TYPE }),
       });
       if (!res.ok) {
@@ -158,7 +165,7 @@ export default function WebSiteManagePage() {
         try {
           const res = await fetch(`${API_BASE}/sites`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: apiHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({ url: u, scope, type: FIXED_TYPE }),
           });
           if (!res.ok) {
@@ -195,7 +202,7 @@ export default function WebSiteManagePage() {
     if (!confirm("このWebサイトを削除しますか？")) return;
     setLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/sites/${id}`, { method: "DELETE" });
+      const res = await fetch(`${API_BASE}/sites/${id}`, { method: "DELETE", headers: apiHeaders() });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchSites();
     } catch (e: unknown) {

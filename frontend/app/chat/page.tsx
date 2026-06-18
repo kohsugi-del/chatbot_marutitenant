@@ -229,7 +229,7 @@ export default function ChatPage() {
                 <div className="text-sm text-zinc-400">
                   例：
                   <span className="text-zinc-200">
-                    「はたらくあさひかわとは？」
+                    「サービスについて教えてください」
                   </span>
                 </div>
               ) : null}

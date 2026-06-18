@@ -69,6 +69,7 @@ export type Message = {
 export type ChatRequest = {
   session_id: string;
   client_id: string;
+  tenant_id?: string;           // マルチテナント: Supabase絞り込み用
   category_id: string | null;
   mode: ConversationMode;
   message: string;
